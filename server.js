@@ -2268,6 +2268,1039 @@ app.post("/api/founder/export/markdown", authenticateSession, (req, res) => {
   }
 });
 
+function slugify(value) {
+  return String(value || "local-growth")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function createLocalGrowthSource({
+  type,
+  title,
+  summary,
+  content,
+  url,
+  provider,
+  tags = [],
+  metadata = {},
+  locationId,
+}) {
+  const timestamp = Date.now();
+  return {
+    id: `local_source_${timestamp}_${Math.random().toString(36).slice(2, 10)}`,
+    type,
+    title,
+    summary,
+    content,
+    url,
+    provider,
+    tags,
+    metadata,
+    locationId,
+    status: "ready",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function createCompetitorProfile({
+  name,
+  url,
+  summary,
+  positioning = "",
+  pricingSignal = "",
+  reviewThemes = [],
+  strengths = [],
+  gaps = [],
+  distanceKm,
+  locationId,
+  citations = [],
+}) {
+  return {
+    id: `competitor_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    name,
+    url,
+    summary,
+    positioning,
+    pricingSignal,
+    reviewThemes,
+    strengths,
+    gaps,
+    distanceKm,
+    locationId,
+    citations,
+    updatedAt: Date.now(),
+  };
+}
+
+function getLocalGrowthFeatureAvailability() {
+  const posthogKey =
+    process.env.POSTHOG_PROJECT_API_KEY ||
+    process.env.POSTHOG_API_KEY ||
+    process.env.POSTHOG_KEY;
+  const appwriteReady =
+    Boolean(process.env.APPWRITE_PROJECT_ID) &&
+    Boolean(process.env.APPWRITE_ENDPOINT) &&
+    Boolean(process.env.APPWRITE_API_KEY) &&
+    Boolean(process.env.APPWRITE_BUCKET_ID);
+
+  return {
+    research:
+      Boolean(getPrimaryKey("TAVILY_API_KEY")) ||
+      Boolean(getPrimaryKey("FIRECRAWL_API_KEY")) ||
+      Boolean(getPrimaryKey("JINA_API_KEY")),
+    geo:
+      Boolean(process.env.HERE_API_KEY) ||
+      Boolean(process.env.OPENCAGE_API_KEY) ||
+      Boolean(process.env.MAPBOX_ACCESS_TOKEN),
+    voice:
+      Boolean(getPrimaryKey("DEEPGRAM_API_KEY")) ||
+      Boolean(getPrimaryKey("ELEVENLABS_API_KEY")),
+    sharing: appwriteReady,
+    approvals: false,
+    analytics: Boolean(process.env.POSTHOG_HOST) && Boolean(posthogKey),
+    leadAgent: false,
+    creativeLab:
+      Boolean(getPrimaryKey("FASTROUTER_API_KEY")) ||
+      Boolean(process.env.REPLICATE_API_TOKEN) ||
+      Boolean(process.env.HUGGINGFACE_API_KEY),
+  };
+}
+
+function dedupeLocalGrowthSources(sources) {
+  const merged = new Map();
+  sources
+    .filter(Boolean)
+    .forEach((source) => {
+      const key = source.url || `${source.type}:${source.title}`.toLowerCase();
+      const current = merged.get(key);
+      if (!current || (source.updatedAt || 0) >= (current.updatedAt || 0)) {
+        merged.set(key, source);
+      }
+    });
+  return Array.from(merged.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+function dedupeCompetitorProfiles(competitors) {
+  const merged = new Map();
+  competitors
+    .filter(Boolean)
+    .forEach((competitor) => {
+      const key =
+        competitor.url ||
+        `${competitor.name}:${competitor.locationId || "global"}`.toLowerCase();
+      const current = merged.get(key);
+      if (!current || (competitor.updatedAt || 0) >= (current.updatedAt || 0)) {
+        merged.set(key, competitor);
+      }
+    });
+  return Array.from(merged.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+async function geocodeWithHere(queryText) {
+  const apiKey = process.env.HERE_API_KEY;
+  if (!apiKey) return null;
+
+  const response = await fetch(
+    `https://geocode.search.hereapi.com/v1/geocode?q=${encodeURIComponent(queryText)}&apiKey=${apiKey}`,
+  );
+
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(parseErrorMessage(raw, `HERE geocode failed (${response.status})`));
+  }
+
+  const data = await response.json();
+  const item = data?.items?.[0];
+  if (!item?.position) return null;
+
+  return {
+    provider: "here",
+    lat: item.position.lat,
+    lng: item.position.lng,
+    city: item.address?.city || item.address?.district || "",
+    region: item.address?.state || "",
+    postalCode: item.address?.postalCode || "",
+    country: item.address?.countryName || item.address?.countryCode || "",
+    timezone: item.timeZone?.name || "",
+    label: item.address?.label || "",
+  };
+}
+
+async function geocodeWithOpenCage(queryText) {
+  const apiKey = process.env.OPENCAGE_API_KEY;
+  if (!apiKey) return null;
+
+  const response = await fetch(
+    `https://api.opencagedata.com/geocode/v1/json?q=${encodeURIComponent(queryText)}&key=${apiKey}&limit=1&no_annotations=0`,
+  );
+
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(parseErrorMessage(raw, `OpenCage geocode failed (${response.status})`));
+  }
+
+  const data = await response.json();
+  const item = data?.results?.[0];
+  if (!item?.geometry) return null;
+
+  return {
+    provider: "opencage",
+    lat: item.geometry.lat,
+    lng: item.geometry.lng,
+    city:
+      item.components?.city ||
+      item.components?.town ||
+      item.components?.village ||
+      "",
+    region: item.components?.state || "",
+    postalCode: item.components?.postcode || "",
+    country: item.components?.country || "",
+    timezone: item.annotations?.timezone?.name || "",
+    label: item.formatted || "",
+  };
+}
+
+async function geocodeWithMapbox(queryText) {
+  const apiKey = process.env.MAPBOX_ACCESS_TOKEN;
+  if (!apiKey) return null;
+
+  const response = await fetch(
+    `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(queryText)}.json?limit=1&access_token=${apiKey}`,
+  );
+
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(parseErrorMessage(raw, `Mapbox geocode failed (${response.status})`));
+  }
+
+  const data = await response.json();
+  const item = data?.features?.[0];
+  if (!item?.center) return null;
+
+  const context = Array.isArray(item.context) ? item.context : [];
+  const city = context.find((entry) => entry.id?.startsWith("place"))?.text || "";
+  const region = context.find((entry) => entry.id?.startsWith("region"))?.text || "";
+  const country = context.find((entry) => entry.id?.startsWith("country"))?.text || "";
+  const postalCode = context.find((entry) => entry.id?.startsWith("postcode"))?.text || "";
+
+  return {
+    provider: "mapbox",
+    lat: item.center[1],
+    lng: item.center[0],
+    city,
+    region,
+    postalCode,
+    country,
+    timezone: "",
+    label: item.place_name || "",
+  };
+}
+
+async function enrichLocationPayload(payload) {
+  const queryText = [
+    payload.addressLine,
+    payload.city,
+    payload.region,
+    payload.postalCode,
+    payload.country,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  let geo = null;
+  try {
+    geo = (await geocodeWithHere(queryText)) || geo;
+  } catch (error) {
+    console.warn(`[Local Growth] HERE geocode failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!geo) {
+    try {
+      geo = (await geocodeWithOpenCage(queryText)) || geo;
+    } catch (error) {
+      console.warn(`[Local Growth] OpenCage geocode failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!geo) {
+    try {
+      geo = (await geocodeWithMapbox(queryText)) || geo;
+    } catch (error) {
+      console.warn(`[Local Growth] Mapbox geocode failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return {
+    id: `location_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    name: payload.name || payload.city || payload.addressLine || "Location",
+    addressLine: payload.addressLine || geo?.label || "",
+    city: payload.city || geo?.city || "",
+    region: payload.region || geo?.region || "",
+    postalCode: payload.postalCode || geo?.postalCode || "",
+    country: payload.country || geo?.country || "",
+    coordinates: geo
+      ? {
+          lat: geo.lat,
+          lng: geo.lng,
+        }
+      : undefined,
+    serviceRadiusKm: Number(payload.serviceRadiusKm || 10),
+    timezone: geo?.timezone || "",
+    notes: payload.notes || "",
+    provider: geo?.provider || "manual",
+    updatedAt: Date.now(),
+  };
+}
+
+function buildStaticMapUrl(locations) {
+  const token = process.env.MAPBOX_ACCESS_TOKEN;
+  if (!token) return null;
+
+  const markers = locations
+    .filter((location) => location.coordinates)
+    .slice(0, 6)
+    .map(
+      (location, index) =>
+        `pin-s-${index % 2 === 0 ? "1d4ed8" : "0f766e"}(${location.coordinates.lng},${location.coordinates.lat})`,
+    );
+
+  if (markers.length === 0) return null;
+
+  return `https://api.mapbox.com/styles/v1/mapbox/light-v11/static/${markers.join(",")}/auto/1000x420?padding=60&access_token=${token}`;
+}
+
+function inferBrandSnapshot(websiteUrl, scrapedTitle, summary, brandNotes) {
+  let hostname = "";
+  try {
+    hostname = new URL(websiteUrl).hostname.replace(/^www\./, "");
+  } catch {
+    hostname = websiteUrl;
+  }
+
+  const titleText = scrapedTitle || hostname;
+  const clientName = titleText
+    .split(/[-|]/)[0]
+    .replace(/\.(com|co|io|ai|net|org)$/i, "")
+    .trim();
+
+  return {
+    clientName,
+    websiteUrl,
+    differentiators: summary || brandNotes || "",
+    proofPoints: brandNotes || "",
+    brandNotes: brandNotes || "",
+  };
+}
+
+function computeVisibilityAudit(workspace, sources, competitors, locationIds) {
+  const websiteText = sources
+    .filter((source) => source.type === "website")
+    .map((source) => `${source.summary || ""}\n${source.content || ""}`)
+    .join("\n")
+    .toLowerCase();
+  const brandText = [
+    workspace?.brand?.coreOffer,
+    workspace?.brand?.goals,
+    workspace?.brand?.differentiators,
+    websiteText,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  const locationTerms = Array.isArray(workspace?.locations)
+    ? workspace.locations
+        .filter((location) => locationIds.includes(location.id))
+        .flatMap((location) => [location.city, location.region, location.country])
+        .filter(Boolean)
+    : [];
+
+  const termMatches = locationTerms.filter((term) =>
+    brandText.includes(String(term).toLowerCase()),
+  ).length;
+  const localIntentCoverage = locationTerms.length
+    ? Math.min(100, Math.round((termMatches / locationTerms.length) * 100))
+    : 45;
+
+  const trustWords = ["review", "testimonial", "award", "trusted", "years", "guarantee"];
+  const geoWords = ["location", "near", "service area", "city", "address", "map"];
+  const conversionWords = ["book", "schedule", "contact", "call", "quote", "demo"];
+
+  const trustSignals = Math.min(
+    100,
+    trustWords.filter((word) => brandText.includes(word)).length * 18 + 28,
+  );
+  const geoSignals = Math.min(
+    100,
+    geoWords.filter((word) => brandText.includes(word)).length * 18 + 22,
+  );
+  const offerClarity = workspace?.brand?.coreOffer ? 82 : 38;
+  const conversionClarity = Math.min(
+    100,
+    conversionWords.filter((word) => brandText.includes(word)).length * 20 + 20,
+  );
+
+  const score = Math.round(
+    (localIntentCoverage + trustSignals + geoSignals + offerClarity + conversionClarity) / 5,
+  );
+
+  const opportunities = [];
+  const risks = [];
+  if (localIntentCoverage < 70) opportunities.push("Add city and service-area language to core pages and offers.");
+  if (trustSignals < 70) opportunities.push("Surface stronger proof such as reviews, guarantees, and named case studies.");
+  if (conversionClarity < 70) opportunities.push("Tighten CTAs and conversion paths on local landing pages.");
+  if (competitors.length > 0) opportunities.push("Build comparison pages against the strongest nearby competitors.");
+  if (geoSignals < 60) risks.push("Geo relevance is weak, which can reduce local discoverability.");
+  if (trustSignals < 60) risks.push("Trust signals are thin relative to the category.");
+  if (!workspace?.brand?.coreOffer) risks.push("Core offer is not clearly defined in the workspace.");
+
+  return {
+    id: `audit_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    title: `${workspace?.brand?.clientName || "Client"} readiness audit`,
+    summary:
+      score >= 75
+        ? "The workspace has a strong base for localized campaigns, but still needs tighter proof and location-specific execution."
+        : "The workspace needs stronger geo relevance, proof signals, and conversion clarity before it will perform like a local growth engine.",
+    score,
+    metrics: {
+      localIntentCoverage,
+      trustSignals,
+      geoSignals,
+      offerClarity,
+      conversionClarity,
+    },
+    opportunities,
+    risks,
+    citations: sources
+      .slice(0, 8)
+      .map((source) => source.url || source.title)
+      .filter(Boolean),
+    competitorIds: competitors.slice(0, 8).map((competitor) => competitor.id),
+    locationIds,
+    staticMapUrl: buildStaticMapUrl(
+      Array.isArray(workspace?.locations)
+        ? workspace.locations.filter((location) => locationIds.includes(location.id))
+        : [],
+    ),
+    updatedAt: Date.now(),
+  };
+}
+
+function buildLocalGrowthExportMarkdown(workspace) {
+  const lines = [];
+  lines.push(`# ${workspace?.brand?.clientName || workspace?.name || "Local Growth OS Workspace"}`);
+  lines.push("");
+  lines.push(`Updated: ${new Date(workspace?.updatedAt || Date.now()).toLocaleString()}`);
+  lines.push("");
+  lines.push("## Brand");
+  lines.push("");
+  lines.push(`- Website: ${workspace?.brand?.websiteUrl || "Not set"}`);
+  lines.push(`- Vertical: ${workspace?.brand?.vertical || "Not set"}`);
+  lines.push(`- Audience: ${workspace?.brand?.targetAudience || "Not set"}`);
+  lines.push(`- Core Offer: ${workspace?.brand?.coreOffer || "Not set"}`);
+  lines.push(`- Goals: ${workspace?.brand?.goals || "Not set"}`);
+  lines.push("");
+  lines.push("## Locations");
+  lines.push("");
+  if (Array.isArray(workspace?.locations) && workspace.locations.length > 0) {
+    workspace.locations.forEach((location) => {
+      lines.push(`### ${location.name}`);
+      lines.push(
+        `- ${[
+          location.addressLine,
+          location.city,
+          location.region,
+          location.postalCode,
+          location.country,
+        ]
+          .filter(Boolean)
+          .join(", ")}`,
+      );
+      lines.push(`- Radius: ${location.serviceRadiusKm} km`);
+      lines.push("");
+    });
+  } else {
+    lines.push("No locations yet.");
+    lines.push("");
+  }
+  lines.push("## Assets");
+  lines.push("");
+  if (Array.isArray(workspace?.assets)) {
+    workspace.assets.forEach((asset) => {
+      const content =
+        asset?.versions?.find((version) => version.id === asset.currentVersionId)?.content || "";
+      lines.push(`### ${asset.title}`);
+      if (asset.imageUrl) lines.push(`Image: ${asset.imageUrl}`);
+      if (asset.audioUrl) lines.push(`Audio: ${asset.audioUrl}`);
+      lines.push("");
+      lines.push(content || "Not generated yet.");
+      lines.push("");
+    });
+  }
+  return lines.join("\n");
+}
+
+app.get("/api/local-growth/features", authenticateSession, (req, res) => {
+  return res.json(getLocalGrowthFeatureAvailability());
+});
+
+app.post("/api/brand/import", authenticateSession, async (req, res) => {
+  const { websiteUrl: rawWebsiteUrl, brandNotes = "" } = req.body || {};
+  if (!rawWebsiteUrl || typeof rawWebsiteUrl !== "string") {
+    return res.status(400).json({ error: "Website URL is required" });
+  }
+
+  try {
+    const websiteUrl = normalizeExternalUrl(rawWebsiteUrl);
+    const brandHostname = new URL(websiteUrl).hostname.replace(/^www\./, "");
+
+    let provider = "manual";
+    let scrapedTitle = brandHostname;
+    let summary = compactText(brandNotes || `Imported ${brandHostname}`, 700);
+    let content = "";
+
+    if (getPrimaryKey("FIRECRAWL_API_KEY") || getPrimaryKey("JINA_API_KEY")) {
+      try {
+        if (getPrimaryKey("FIRECRAWL_API_KEY")) {
+          const data = await scrapeWithFirecrawl(websiteUrl);
+          const scrapeData = data?.data || data;
+          provider = "firecrawl";
+          scrapedTitle =
+            scrapeData?.metadata?.title ||
+            scrapeData?.title ||
+            scrapedTitle;
+          summary = compactText(
+            scrapeData?.summary ||
+              scrapeData?.metadata?.description ||
+              scrapeData?.markdown ||
+              summary,
+            700,
+          );
+          content = compactText(scrapeData?.markdown || "", 6000);
+        } else if (getPrimaryKey("JINA_API_KEY")) {
+          const readerText = await fetchWithJinaReader(websiteUrl);
+          provider = "jina";
+          summary = compactText(readerText || summary, 700);
+          content = compactText(readerText || "", 6000);
+        }
+      } catch (primaryError) {
+        if (getPrimaryKey("JINA_API_KEY") && provider !== "jina") {
+          try {
+            const readerText = await fetchWithJinaReader(websiteUrl);
+            provider = "jina";
+            summary = compactText(readerText || summary, 700);
+            content = compactText(readerText || "", 6000);
+          } catch (fallbackError) {
+            console.warn(
+              `[Local Growth] URL import fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+            );
+          }
+        }
+
+        if (!content && primaryError instanceof Error) {
+          console.warn(
+            `[Local Growth] Website import degraded to manual mode: ${primaryError.message}`,
+          );
+        }
+      }
+    }
+
+    const inferredSummary = compactText(summary || brandNotes, 220);
+    const brandSnapshot = {
+      ...inferBrandSnapshot(websiteUrl, scrapedTitle, summary, brandNotes),
+      targetAudience: "",
+      coreOffer: inferredSummary,
+      goals: compactText(brandNotes, 180),
+      voiceExamples: "",
+      vertical: "",
+    };
+
+    const sources = [
+      createLocalGrowthSource({
+        type: "website",
+        title: scrapedTitle || brandSnapshot.clientName || brandHostname,
+        summary,
+        content,
+        url: websiteUrl,
+        provider,
+        tags: ["brand-import", "website"],
+        metadata: {
+          hostname: brandHostname,
+          inferred: provider === "manual",
+        },
+      }),
+    ];
+
+    const competitors = [];
+    const competitorSources = [];
+
+    if (getPrimaryKey("TAVILY_API_KEY")) {
+      try {
+        const researchQuery = [
+          brandSnapshot.clientName || brandHostname,
+          brandSnapshot.coreOffer,
+          brandNotes,
+          "local competitors market positioning reviews",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        const searchData = await runTavilySearch(researchQuery);
+        const results = Array.isArray(searchData?.results) ? searchData.results : [];
+
+        results
+          .filter((item) => item?.url && !String(item.url).includes(brandHostname))
+          .slice(0, 5)
+          .forEach((item, index) => {
+            const competitor = createCompetitorProfile({
+              name: item?.title || `Competitor ${index + 1}`,
+              url: item?.url,
+              summary: compactText(item?.content || item?.answer || "", 500),
+              positioning: compactText(item?.title || "", 140),
+              pricingSignal: "Unknown",
+              reviewThemes: [],
+              strengths: ["Visible local presence", "Comparable offer coverage"],
+              gaps: ["Positioning can be challenged with stronger proof and geo landing pages"],
+              citations: item?.url ? [item.url] : [],
+            });
+
+            competitors.push(competitor);
+            competitorSources.push(
+              createLocalGrowthSource({
+                type: "competitor",
+                title: item?.title || competitor.name,
+                summary: compactText(item?.content || item?.answer || "", 600),
+                content: compactText(item?.content || item?.raw_content || "", 4000),
+                url: item?.url,
+                provider: "tavily",
+                tags: ["competitor-discovery", "brand-import"],
+                metadata: {
+                  score: typeof item?.score === "number" ? item.score : null,
+                },
+              }),
+            );
+          });
+      } catch (error) {
+        console.warn(
+          `[Local Growth] Competitor discovery failed during brand import: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    return res.json({
+      brandSnapshot,
+      sources: dedupeLocalGrowthSources([...sources, ...competitorSources]),
+      competitors: dedupeCompetitorProfiles(competitors),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to import brand website",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/locations/enrich", authenticateSession, async (req, res) => {
+  const payload = req.body || {};
+  if (!payload.addressLine || typeof payload.addressLine !== "string") {
+    return res.status(400).json({ error: "Location address is required" });
+  }
+
+  try {
+    const location = await enrichLocationPayload(payload);
+    const queryLabel = [
+      location.addressLine,
+      location.city,
+      location.region,
+      location.country,
+    ]
+      .filter(Boolean)
+      .join(", ");
+
+    const sources = [
+      createLocalGrowthSource({
+        type: "location",
+        title: `${location.name} geo profile`,
+        summary: compactText(
+          `${queryLabel || location.name} normalized via ${location.provider || "manual"} with a ${location.serviceRadiusKm} km service radius.`,
+          320,
+        ),
+        content: compactText(
+          [
+            `Address: ${queryLabel || "Not available"}`,
+            location.coordinates
+              ? `Coordinates: ${location.coordinates.lat}, ${location.coordinates.lng}`
+              : "Coordinates: unavailable",
+            `Timezone: ${location.timezone || "Unknown"}`,
+          ].join("\n"),
+          1200,
+        ),
+        provider: location.provider || "manual",
+        tags: ["location-enrichment"],
+        locationId: location.id,
+        metadata: location.coordinates
+          ? {
+              lat: location.coordinates.lat,
+              lng: location.coordinates.lng,
+            }
+          : {},
+      }),
+    ];
+
+    const competitors = [];
+
+    if (getPrimaryKey("TAVILY_API_KEY")) {
+      try {
+        const searchQuery = [
+          payload.brandName || "",
+          payload.vertical || "",
+          "competitors near",
+          location.city || location.addressLine,
+          location.region || "",
+          location.country || "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        const searchData = await runTavilySearch(searchQuery);
+        const results = Array.isArray(searchData?.results) ? searchData.results : [];
+
+        results.slice(0, 4).forEach((item, index) => {
+          const competitor = createCompetitorProfile({
+            name: item?.title || `Nearby competitor ${index + 1}`,
+            url: item?.url,
+            summary: compactText(item?.content || item?.answer || "", 420),
+            positioning: compactText(item?.title || "", 140),
+            pricingSignal: "Unknown",
+            reviewThemes: ["Local discoverability", "Service coverage"],
+            strengths: ["Visible in local search"],
+            gaps: ["Proof depth and geo page quality still need validation"],
+            locationId: location.id,
+            citations: item?.url ? [item.url] : [],
+          });
+
+          competitors.push(competitor);
+          sources.push(
+            createLocalGrowthSource({
+              type: "search",
+              title: item?.title || competitor.name,
+              summary: compactText(item?.content || item?.answer || "", 540),
+              content: compactText(item?.content || item?.raw_content || "", 3200),
+              url: item?.url,
+              provider: "tavily",
+              tags: ["location-intel", slugify(location.name)],
+              locationId: location.id,
+              metadata: {
+                score: typeof item?.score === "number" ? item.score : null,
+              },
+            }),
+          );
+        });
+      } catch (error) {
+        console.warn(
+          `[Local Growth] Nearby competitor scan failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    return res.json({
+      location,
+      sources: dedupeLocalGrowthSources(sources),
+      competitors: dedupeCompetitorProfiles(competitors),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to enrich location",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/intel/audit", authenticateSession, async (req, res) => {
+  const { workspace, focusLocationIds } = req.body || {};
+  if (!workspace || typeof workspace !== "object") {
+    return res.status(400).json({ error: "Workspace payload is required" });
+  }
+
+  try {
+    const allLocations = Array.isArray(workspace.locations) ? workspace.locations : [];
+    const activeLocationIds =
+      Array.isArray(focusLocationIds) && focusLocationIds.length > 0
+        ? focusLocationIds
+        : allLocations.slice(0, 6).map((location) => location.id);
+    const activeLocations = allLocations.filter((location) =>
+      activeLocationIds.includes(location.id),
+    );
+
+    const freshSources = [];
+    const freshCompetitors = [];
+    const brandHostname = workspace?.brand?.websiteUrl
+      ? new URL(normalizeExternalUrl(workspace.brand.websiteUrl)).hostname.replace(/^www\./, "")
+      : null;
+
+    if (getPrimaryKey("TAVILY_API_KEY")) {
+      for (const location of activeLocations.slice(0, 3)) {
+        const queryText = [
+          workspace?.brand?.clientName || "",
+          workspace?.brand?.vertical || "",
+          workspace?.brand?.coreOffer || "",
+          location.city || location.addressLine,
+          location.region || "",
+          location.country || "",
+          "local competitors reviews trust signals citations",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+        try {
+          const searchData = await runTavilySearch(queryText);
+          const results = Array.isArray(searchData?.results) ? searchData.results : [];
+
+          results.slice(0, 4).forEach((item, index) => {
+            freshSources.push(
+              createLocalGrowthSource({
+                type: "search",
+                title: item?.title || `${location.name} market signal ${index + 1}`,
+                summary: compactText(item?.content || item?.answer || "", 620),
+                content: compactText(item?.content || item?.raw_content || "", 3600),
+                url: item?.url,
+                provider: "tavily",
+                tags: ["intel-audit", slugify(location.name)],
+                locationId: location.id,
+                metadata: {
+                  score: typeof item?.score === "number" ? item.score : null,
+                },
+              }),
+            );
+
+            if (!item?.url || (brandHostname && String(item.url).includes(brandHostname))) {
+              return;
+            }
+
+            freshCompetitors.push(
+              createCompetitorProfile({
+                name: item?.title || `Competitor ${index + 1}`,
+                url: item?.url,
+                summary: compactText(item?.content || item?.answer || "", 480),
+                positioning: compactText(item?.title || "", 160),
+                pricingSignal: "Unknown",
+                reviewThemes: ["Local intent", "Category visibility"],
+                strengths: ["Ranking presence", "Comparable service narrative"],
+                gaps: [
+                  "Differentiate with stronger proof, offer specificity, and geo landing pages",
+                ],
+                locationId: location.id,
+                citations: item?.url ? [item.url] : [],
+              }),
+            );
+          });
+        } catch (error) {
+          console.warn(
+            `[Local Growth] Tavily intel query failed for ${location.name}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    }
+
+    const mergedSources = dedupeLocalGrowthSources([
+      ...(Array.isArray(workspace.sources) ? workspace.sources : []),
+      ...freshSources,
+    ]);
+    const mergedCompetitors = dedupeCompetitorProfiles([
+      ...(Array.isArray(workspace.competitors) ? workspace.competitors : []),
+      ...freshCompetitors,
+    ]);
+    const audit = computeVisibilityAudit(
+      workspace,
+      mergedSources,
+      mergedCompetitors,
+      activeLocationIds,
+    );
+
+    return res.json({
+      audit,
+      sources: freshSources,
+      competitors: freshCompetitors,
+      mapUrl: audit.staticMapUrl || null,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to run local growth audit",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/assets/share", authenticateSession, async (req, res) => {
+  const { bundle, workspace } = req.body || {};
+  if (!bundle || typeof bundle !== "object" || !workspace || typeof workspace !== "object") {
+    return res.status(400).json({ error: "Bundle and workspace payloads are required" });
+  }
+
+  const appwriteReady =
+    Boolean(process.env.APPWRITE_PROJECT_ID) &&
+    Boolean(process.env.APPWRITE_ENDPOINT) &&
+    Boolean(process.env.APPWRITE_API_KEY) &&
+    Boolean(process.env.APPWRITE_BUCKET_ID);
+
+  if (!appwriteReady) {
+    return res.json({
+      enabled: false,
+      provider: "appwrite-disabled",
+    });
+  }
+
+  return res.json({
+    enabled: false,
+    provider: "appwrite-pending",
+  });
+});
+
+app.post("/api/assets/export-markdown", authenticateSession, (req, res) => {
+  const { workspace } = req.body || {};
+  if (!workspace || typeof workspace !== "object") {
+    return res.status(400).json({ error: "Workspace payload is required" });
+  }
+
+  try {
+    const markdown = buildLocalGrowthExportMarkdown(workspace);
+    return res.json({ markdown });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to export Local Growth workspace",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/approvals/sync", authenticateSession, async (req, res) => {
+  const { thread } = req.body || {};
+  if (!thread || typeof thread !== "object") {
+    return res.status(400).json({ error: "Approval thread payload is required" });
+  }
+
+  return res.json({
+    synced: false,
+    provider: "local",
+  });
+});
+
+app.post("/api/analytics/capture", authenticateSession, async (req, res) => {
+  const { event, payload = {} } = req.body || {};
+  if (!event || typeof event !== "string") {
+    return res.status(400).json({ error: "Event name is required" });
+  }
+
+  const posthogKey =
+    process.env.POSTHOG_PROJECT_API_KEY ||
+    process.env.POSTHOG_API_KEY ||
+    process.env.POSTHOG_KEY;
+  const posthogHost = process.env.POSTHOG_HOST;
+
+  if (!posthogKey || !posthogHost) {
+    return res.json({
+      tracked: false,
+      provider: "disabled",
+    });
+  }
+
+  try {
+    const response = await fetch(`${posthogHost.replace(/\/+$/g, "")}/capture/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        api_key: posthogKey,
+        event,
+        properties: {
+          ...(payload && typeof payload === "object" ? payload : {}),
+          distinct_id: req.session.id,
+          session_id: req.session.id,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const raw = await response.text();
+      throw new Error(parseErrorMessage(raw, `PostHog capture failed (${response.status})`));
+    }
+
+    return res.json({
+      tracked: true,
+      provider: "posthog",
+    });
+  } catch (error) {
+    return res.status(502).json({
+      error: "Failed to capture analytics event",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/voice/transcribe", authenticateSession, async (req, res) => {
+  const { audioDataUrl } = req.body || {};
+  if (!audioDataUrl || typeof audioDataUrl !== "string") {
+    return res.status(400).json({ error: "Audio payload is required" });
+  }
+
+  try {
+    const { buffer, mimeType } = dataUrlToBuffer(audioDataUrl);
+    const data = await transcribeWithDeepgram(buffer, mimeType);
+    const transcript =
+      data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+
+    if (!transcript.trim()) {
+      return res.status(422).json({
+        error: "Deepgram did not return a transcript",
+      });
+    }
+
+    return res.json({ transcript: transcript.trim() });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to transcribe voice brief",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/voice/synthesize", authenticateSession, async (req, res) => {
+  const { text } = req.body || {};
+  if (!text || typeof text !== "string") {
+    return res.status(400).json({ error: "Text is required" });
+  }
+
+  try {
+    const audioDataUrl = await synthesizeWithElevenLabs(text);
+    return res.json({ audioDataUrl });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to synthesize voice script",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/api/voice/lead-agent", authenticateSession, async (req, res) => {
+  const { workspace, locationId } = req.body || {};
+  const location = Array.isArray(workspace?.locations)
+    ? workspace.locations.find((item) => item.id === locationId) || workspace.locations[0]
+    : null;
+
+  return res.json({
+    enabled: false,
+    leadCapture: {
+      id: `lead_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+      locationId: location?.id,
+      status: "disabled",
+      summary: location
+        ? `Lead intake preview is disabled for ${location.name}. Add a production Vapi provisioning flow before enabling it.`
+        : "Lead intake preview is disabled until a location is selected.",
+      provider: process.env.VAPI_API_KEY ? "vapi-disabled" : "disabled",
+      updatedAt: Date.now(),
+    },
+  });
+});
+
 // Initialize key cache before starting server
 initializeKeyCache();
 
